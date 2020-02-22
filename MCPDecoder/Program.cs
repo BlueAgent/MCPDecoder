@@ -150,11 +150,11 @@ namespace MCPDecoder
             Console.Error.WriteLine("Skipping {0}", name);
         }
 
+        static Regex fieldMatch = new Regex(@"field_\d+?_\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        static Regex methodMatch = new Regex(@"func_\d+?_\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         static string ReplaceFieldsAndMethods(string input, Dictionary<string, Dictionary<string, string>> fields, Dictionary<string, Dictionary<string, string>> methods)
         {
-            Regex fieldMatch = new Regex(@"field_\d+?_\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-            Regex methodMatch = new Regex(@"func_\d+?_\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
             input = fieldMatch.Replace(input, SpecialMatchEvaluator(fields));
             input = methodMatch.Replace(input, SpecialMatchEvaluator(methods));
 
