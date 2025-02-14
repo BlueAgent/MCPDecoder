@@ -1,11 +1,11 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
-using System.IO;
-using System.Collections;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows;
 
 namespace MCPDecoder
@@ -15,54 +15,56 @@ namespace MCPDecoder
         [STAThread]
         static void Main(string[] args)
         {
-            string fieldsPath = AppDomain.CurrentDomain.BaseDirectory + "fields.csv";
-            string methodsPath = AppDomain.CurrentDomain.BaseDirectory + "methods.csv";
-
-            if (!File.Exists(fieldsPath))
+            string[] fileNames =
             {
-                Console.WriteLine("Missing fields.csv");
-                return;
-            }
+                "fields.csv",
+                "methods.csv",
+                "mappings.tiny"
+            };
 
-            if (!File.Exists(methodsPath))
-            {
-                Console.WriteLine("Missing methods.csv");
-                return;
-            }
+            var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            var filePaths = fileNames.Select(fileName => Path.Combine(baseDirectory, fileName));
 
-            Dictionary<string, Dictionary<string, string>> fields = null;
-            Dictionary<string, Dictionary<string, string>> methods = null;
-            try
+            if (args.Length == 1 && args[0] == "print")
             {
-                using (StreamReader stream = File.OpenText(fieldsPath))
+                foreach (var path in filePaths)
                 {
-                    fields = ProcessCSV(stream);
+                    var debugPath = path + ".log";
+                    using (StreamWriter stream = File.CreateText(debugPath))
+                    {
+                        if (path.EndsWith(".csv"))
+                        {
+                            Print(stream, ProcessCSVAsync(path).Result);
+                        }
+                        else if (path.EndsWith(".tiny"))
+                        {
+                            Print(stream, Tiny.ProcessAsync(path).Result);
+                        }
+                    }
+                    Console.WriteLine($"Written {Path.GetFileName(debugPath)}");
                 }
 
-                using (StreamReader stream = File.OpenText(methodsPath))
-                {
-                    methods = ProcessCSV(stream);
-                }
-            }
-            catch (FileNotFoundException e)
-            {
-                Console.WriteLine("Missing fields.csv or methods.csv");
-                Console.WriteLine(e.ToString());
                 return;
             }
 
-            if(fields == null || methods == null)
-            {
-                Console.WriteLine("Unable to process fields.csv and/or methods.csv");
-                return;
-            }
+            var replacements = filePaths
+                .Select(ProcessCSVAsync)
+                .SelectMany(t => t?.Result?.AsEnumerable() ?? Enumerable.Empty<KeyValuePair<string, Dictionary<string, string>>>())
+                .ToDictionary(kv => kv.Key, kv => kv.Value["name"]);
+            var keyRegex = BuildRegex(replacements.Keys);
 
-            if(args.Length == 0)
+            var replacementData = new ReplacerCache()
+            {
+                Replacements = replacements,
+                Regex = keyRegex,
+            };
+
+            if (args.Length == 0)
             {
                 if (Clipboard.ContainsText())
                 {
                     string text = Clipboard.GetText();
-                    text = ReplaceFieldsAndMethods(text, fields, methods);
+                    text = ReplaceFieldsAndMethods(text, replacementData);
                     Clipboard.SetText(text);
                     Console.WriteLine("Processed clipboard");
                 }
@@ -72,57 +74,43 @@ namespace MCPDecoder
                 }
                 return;
             }
-            
-            if(args.Length == 1 && args[0] == "print")
-            {
-                using (StreamWriter stream = File.CreateText("fields.csv.log"))
-                {
-                    Print(stream, fields);
-                }
-
-                Console.WriteLine("Written fields.csv.log");
-
-                using (StreamWriter stream = File.CreateText("methods.csv.log"))
-                {
-                    Print(stream, methods);
-                }
-
-                Console.WriteLine("Written methods.csv.log");
-                return;
-            }
 
             bool replace = false;
+            var tasks = new List<Task>();
 
             foreach (string name in args)
             {
-                if(name == "r")
+                if (name == "r")
                 {
                     replace = !replace;
                     continue;
                 }
-                ProcessPath(name, fields, methods, replace);
+                tasks.Add(ProcessPathAsync(name, replacementData, replace));
             }
+            Task.WhenAll(tasks).Wait();
         }
 
-        private static void ProcessPath(string name, Dictionary<string, Dictionary<string, string>> fields, Dictionary<string, Dictionary<string, string>> methods, bool replace = false)
+        private static async Task ProcessPathAsync(string name, ReplacerCache replacementData, bool replace = false)
         {
-            if(Directory.Exists(name))
+            if (Directory.Exists(name))
             {
                 Console.Out.WriteLine("Recursing into {0}", name);
-                //Recursively call for all files and directories inside
-                foreach(string sub in Directory.EnumerateFileSystemEntries(name))
-                {
-                    ProcessPath(sub, fields, methods, replace);
-                }
+                // Recursively call for all files and directories inside
+                await Task.WhenAll(Directory.EnumerateFileSystemEntries(name)
+                    .Select(sub => ProcessPathAsync(sub, replacementData, replace)));
                 return;
             }
 
             if (File.Exists(name) && name.EndsWith(".java"))
             {
                 Console.Out.WriteLine("Processing {0}", name);
-                string document = File.ReadAllText(name);
+                string document;
+                using (var streamReader = File.OpenText(name))
+                {
+                    document = await streamReader.ReadToEndAsync();
+                }
 
-                document = ReplaceFieldsAndMethods(document, fields, methods);
+                document = ReplaceFieldsAndMethods(document, replacementData);
 
                 FileInfo target = new FileInfo(name);
                 while (target.Exists)
@@ -136,7 +124,7 @@ namespace MCPDecoder
                     {
                         File.Delete(path);
                     }
-                    
+
                     target = new FileInfo(path);
                 }
                 using (StreamWriter stream = target.CreateText())
@@ -146,30 +134,36 @@ namespace MCPDecoder
                 return;
             }
 
-            //Console.Error.WriteLine("Not a java source file or directory {0}", name);
             Console.Error.WriteLine("Skipping {0}", name);
         }
 
-        static Regex fieldMatch = new Regex(@"(?<!"")field_\d+?_\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        static Regex methodMatch = new Regex(@"(?<!"")func_\d+?_\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-        static string ReplaceFieldsAndMethods(string input, Dictionary<string, Dictionary<string, string>> fields, Dictionary<string, Dictionary<string, string>> methods)
+        static Regex BuildRegex(IEnumerable<string> keys)
         {
-            input = fieldMatch.Replace(input, SpecialMatchEvaluator(fields));
-            input = methodMatch.Replace(input, SpecialMatchEvaluator(methods));
+            var trie = new Trie();
+            foreach (var key in keys)
+            {
+                trie.Add(key);
+            }
+            //Console.WriteLine(trie);
 
-            return input;
+            StringBuilder sb = new StringBuilder();
+            sb.Append(@"(?<!"")");
+            sb.Append(trie.ToRegex());
+            return new Regex(sb.ToString(), RegexOptions.Compiled);
         }
 
-
-        static MatchEvaluator SpecialMatchEvaluator(Dictionary<string, Dictionary<string, string>> dictionary)
+        static string ReplaceFieldsAndMethods(string input, ReplacerCache replacementData)
         {
-            return (match) => dictionary.ContainsKey(match.Value) ? dictionary[match.Value]["name"] : match.Value;
+            var replacements = replacementData.Replacements;
+            return replacementData.Regex.Replace(
+                input,
+                (match) => replacements.TryGetValue(match.Value, out string replacement) ? replacement : match.Value
+            );
         }
 
         static void Print(TextWriter stream, object o, int depth = 0)
         {
-            if(o is IDictionary)
+            if (o is IDictionary)
             {
                 IDictionary dictionary = (IDictionary)o;
                 foreach (DictionaryEntry pair in dictionary)
@@ -183,7 +177,7 @@ namespace MCPDecoder
                 return;
             }
 
-            //Is it better to do this or just write it? idk
+            // Is it better to do this or just write it? idk
             StringBuilder build = new StringBuilder();
             for (int i = 0; i < depth; i++)
             {
@@ -198,37 +192,66 @@ namespace MCPDecoder
             stream.WriteLine(o);
         }
 
-        static Dictionary<string, Dictionary<string, string>> ProcessCSV(StreamReader stream)
+        static async Task<Dictionary<string, Dictionary<string, string>>> ProcessCSVAsync(string path)
         {
-            Dictionary<string, Dictionary<string, string>> output = new Dictionary<string, Dictionary<string, string>>();
-            string[] columns = null;
-            string line;
-            while ((line = stream.ReadLine()) != null)
+            if (!File.Exists(path))
             {
-                string[] processed = ProcessLine(line);
-                if (processed.Length == 0) continue; //Ignores empty lines
-                if (columns == null)
-                {
-                    columns = processed;
-                    continue;
-                }
-                if (processed.Length != columns.Length)
-                {
-                    Console.Error.WriteLine("Line Lengths do not match");
-                    continue; //Ignore
-                }
-                string key = processed[0];
-                Dictionary<string, string> values = new Dictionary<string, string>();
-
-                for(int i = 1; i < columns.Length; i++)
-                {
-                    values.Add(columns[i], processed[i]);
-                }
-                while(output.ContainsKey(key)) key = key + "_";
-                output.Add(key, values);
+                Console.WriteLine($"Missing {Path.GetFileName(path)}");
+                return null;
             }
 
-            return output;
+            try
+            {
+                using (StreamReader stream = File.OpenText(path))
+                {
+                    Dictionary<string, Dictionary<string, string>> output = new Dictionary<string, Dictionary<string, string>>();
+                    string[] headers = null;
+                    string line;
+                    while ((line = await stream.ReadLineAsync()) != null)
+                    {
+                        string[] processed = ProcessLine(line);
+                        if (processed.Length == 0) continue; // Ignores empty or broken lines
+                        if (headers == null) // Use first row as column headers
+                        {
+                            headers = processed;
+                            continue;
+                        }
+                        if (processed.Length != headers.Length)
+                        {
+                            Console.Error.WriteLine($"Line length ({processed.Length}) does not match header length ({headers.Length}): {string.Join(", ", processed)}");
+                            continue; // Ignore
+                        }
+                        string key = processed[0]; // Use the first column as the lookup
+                        Dictionary<string, string> valuesByHeader = new Dictionary<string, string>();
+
+                        for (int i = 1; i < headers.Length; i++)
+                        {
+                            valuesByHeader.Add(headers[i], processed[i]);
+                        }
+                        if (output.ContainsKey(key))
+                        {
+                            //if (output[key].Keys != valuesByHeader.Keys && output[key].Any(kv => valuesByHeader[kv.Key] != kv.Value))
+                            if (output[key].Keys != valuesByHeader.Keys && output[key].Any(kv => valuesByHeader[kv.Key] != kv.Value))
+                            {
+                                Console.Error.WriteLine($"Skipping duplicate key '{key}'.");
+                                Console.Error.WriteLine($"Existing: [{string.Join(", ", output[key].Values)}].");
+                                Console.Error.WriteLine($"Duplicate: [{string.Join(", ", valuesByHeader.Values)}].");
+                            }
+                            continue;
+                        }
+
+                        output.Add(key, valuesByHeader);
+                    }
+
+                    return output;
+                }
+            }
+            catch (FileNotFoundException e)
+            {
+                Console.WriteLine($"Missing {Path.GetFileName(path)}");
+                Console.WriteLine(e.ToString());
+                return null;
+            }
         }
 
         /// <summary>
@@ -307,6 +330,10 @@ namespace MCPDecoder
             return tokens.ToArray<string>();
         }
 
+        private sealed class ReplacerCache
+        {
+            public Dictionary<string, string> Replacements { get; set; }
+            public Regex Regex { get; set; }
+        }
     }
-
 }
